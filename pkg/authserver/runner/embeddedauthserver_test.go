@@ -282,10 +282,11 @@ func TestParseTokenLifespans(t *testing.T) {
 func TestResolveSecret(t *testing.T) {
 	t.Parallel()
 
-	t.Run("returns empty string when neither set", func(t *testing.T) {
+	t.Run("returns empty string and no error when neither set", func(t *testing.T) {
 		t.Parallel()
 
-		result := resolveSecret("", "")
+		result, err := resolveSecret("", "")
+		require.NoError(t, err)
 		assert.Empty(t, result)
 	})
 
@@ -297,8 +298,31 @@ func TestResolveSecret(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(secretFile, []byte("  secret-value  \n"), 0600))
 
-		result := resolveSecret(secretFile, "")
+		result, err := resolveSecret(secretFile, "")
+		require.NoError(t, err)
 		assert.Equal(t, "secret-value", result)
+	})
+
+	t.Run("returns error when file is set but unreadable", func(t *testing.T) {
+		t.Parallel()
+
+		result, err := resolveSecret("/nonexistent/file", "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to read secret file")
+		assert.Empty(t, result)
+	})
+
+	t.Run("returns error when env var is specified but not populated", func(t *testing.T) {
+		t.Parallel()
+
+		// Use a unique env var name that won't be set in the environment
+		envVar := "TEST_SECRET_NOT_SET_12345"
+
+		result, err := resolveSecret("", envVar)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "environment variable")
+		assert.Contains(t, err.Error(), "is not set")
+		assert.Empty(t, result)
 	})
 }
 
@@ -316,17 +340,29 @@ func TestResolveSecretWithEnvVar(t *testing.T) {
 		envVar := "TEST_SECRET_FILE_PRECEDENCE"
 		t.Setenv(envVar, "secret-from-env")
 
-		result := resolveSecret(secretFile, envVar)
+		result, err := resolveSecret(secretFile, envVar)
+		require.NoError(t, err)
 		assert.Equal(t, fileSecret, result)
 	})
 
-	t.Run("falls back to env var when file missing", func(t *testing.T) {
-		envVar := "TEST_SECRET_FALLBACK"
+	t.Run("reads from env var when only env var is set", func(t *testing.T) {
+		envVar := "TEST_SECRET_ENV_ONLY"
 		envSecret := "secret-from-env"
 		t.Setenv(envVar, envSecret)
 
-		result := resolveSecret("/nonexistent/file", envVar)
+		result, err := resolveSecret("", envVar)
+		require.NoError(t, err)
 		assert.Equal(t, envSecret, result)
+	})
+
+	t.Run("returns error when file is set but missing (does not fall back to env)", func(t *testing.T) {
+		envVar := "TEST_SECRET_NO_FALLBACK"
+		t.Setenv(envVar, "secret-from-env")
+
+		result, err := resolveSecret("/nonexistent/file", envVar)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to read secret file")
+		assert.Empty(t, result)
 	})
 }
 

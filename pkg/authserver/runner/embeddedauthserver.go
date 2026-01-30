@@ -18,6 +18,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
+	"github.com/stacklok/toolhive/pkg/logger"
 )
 
 // EmbeddedAuthServer wraps the authorization server for integration with the proxy runner.
@@ -230,7 +231,10 @@ func buildOIDCConfig(ctx context.Context, rc *authserver.UpstreamRunConfig) (*up
 	}
 
 	oidc := rc.OIDCConfig
-	clientSecret := resolveSecret(oidc.ClientSecretFile, oidc.ClientSecretEnvVar)
+	clientSecret, err := resolveSecret(oidc.ClientSecretFile, oidc.ClientSecretEnvVar)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve OIDC client secret: %w", err)
+	}
 
 	// Perform OIDC discovery to get the actual endpoints
 	discoveryDoc, err := oauth.DiscoverOIDCEndpoints(ctx, oidc.IssuerURL)
@@ -266,7 +270,10 @@ func buildPureOAuth2Config(rc *authserver.UpstreamRunConfig) (*upstream.OAuth2Co
 	}
 
 	oauth2 := rc.OAuth2Config
-	clientSecret := resolveSecret(oauth2.ClientSecretFile, oauth2.ClientSecretEnvVar)
+	clientSecret, err := resolveSecret(oauth2.ClientSecretFile, oauth2.ClientSecretEnvVar)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve OAuth2 client secret: %w", err)
+	}
 
 	return &upstream.OAuth2Config{
 		CommonOAuthConfig: upstream.CommonOAuthConfig{
@@ -282,20 +289,27 @@ func buildPureOAuth2Config(rc *authserver.UpstreamRunConfig) (*upstream.OAuth2Co
 }
 
 // resolveSecret reads a secret from file or environment variable.
-// File takes precedence over env var. Returns empty string if neither is set.
-func resolveSecret(file, envVar string) string {
+// File takes precedence over env var. Returns an error if file is specified but
+// unreadable, or if envVar is specified but not set. Returns empty string with
+// no error if neither file nor envVar is specified.
+func resolveSecret(file, envVar string) (string, error) {
 	if file != "" {
 		// #nosec G304 - file path is from configuration, not user input
 		data, err := os.ReadFile(file)
-		if err == nil {
-			return string(bytes.TrimSpace(data))
+		if err != nil {
+			return "", fmt.Errorf("failed to read secret file %q: %w", file, err)
 		}
-		// Log warning but continue - secret might be optional for public clients
+		return string(bytes.TrimSpace(data)), nil
 	}
 	if envVar != "" {
-		return os.Getenv(envVar)
+		value := os.Getenv(envVar)
+		if value == "" {
+			return "", fmt.Errorf("environment variable %q is not set", envVar)
+		}
+		return value, nil
 	}
-	return ""
+	logger.Infof("No client secret configured (neither file nor env var specified)")
+	return "", nil
 }
 
 // convertUserInfoConfig converts UserInfoRunConfig to upstream.UserInfoConfig.
