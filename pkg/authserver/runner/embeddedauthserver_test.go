@@ -9,7 +9,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -604,5 +607,246 @@ func TestNewEmbeddedAuthServer(t *testing.T) {
 		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
 		require.Error(t, err)
 		assert.Nil(t, server)
+	})
+}
+
+func TestBuildOIDCConfig(t *testing.T) {
+	t.Parallel()
+
+	// Constants for OIDC well-known paths used in test mocks
+	const (
+		wellKnownOIDCPath  = "/.well-known/openid-configuration"
+		wellKnownOAuthPath = "/.well-known/oauth-authorization-server"
+		httpScheme         = "http"
+	)
+
+	t.Run("nil OIDCConfig returns error", func(t *testing.T) {
+		t.Parallel()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type:       authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: nil,
+		}
+
+		_, err := buildOIDCConfig(context.Background(), rc)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "oidc_config required")
+	})
+
+	t.Run("successful discovery populates endpoints", func(t *testing.T) {
+		t.Parallel()
+
+		// Create mock OIDC server with userinfo endpoint
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == wellKnownOIDCPath ||
+				r.URL.Path == wellKnownOAuthPath {
+				issuerURL := httpScheme + "://" + r.Host
+
+				doc := map[string]interface{}{
+					"issuer":                 issuerURL,
+					"authorization_endpoint": issuerURL + "/authorize",
+					"token_endpoint":         issuerURL + "/token",
+					"jwks_uri":               issuerURL + "/.well-known/jwks.json",
+					"userinfo_endpoint":      issuerURL + "/userinfo",
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				err := json.NewEncoder(w).Encode(doc)
+				require.NoError(t, err)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer mockServer.Close()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:   mockServer.URL,
+				ClientID:    "test-client-id",
+				RedirectURI: "http://localhost:8080/callback",
+				Scopes:      []string{"openid", "profile"},
+			},
+		}
+
+		cfg, err := buildOIDCConfig(context.Background(), rc)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		// Verify endpoints from discovery
+		assert.Equal(t, mockServer.URL+"/authorize", cfg.AuthorizationEndpoint)
+		assert.Equal(t, mockServer.URL+"/token", cfg.TokenEndpoint)
+
+		// Verify client config is passed through
+		assert.Equal(t, "test-client-id", cfg.ClientID)
+		assert.Equal(t, "http://localhost:8080/callback", cfg.RedirectURI)
+		assert.Equal(t, []string{"openid", "profile"}, cfg.Scopes)
+
+		// Verify userinfo endpoint is populated from discovery
+		require.NotNil(t, cfg.UserInfo)
+		assert.Equal(t, mockServer.URL+"/userinfo", cfg.UserInfo.EndpointURL)
+	})
+
+	t.Run("UserInfoOverride takes precedence over discovered endpoint", func(t *testing.T) {
+		t.Parallel()
+
+		// Create mock OIDC server with a userinfo endpoint
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == wellKnownOIDCPath ||
+				r.URL.Path == wellKnownOAuthPath {
+				issuerURL := httpScheme + "://" + r.Host
+
+				doc := map[string]interface{}{
+					"issuer":                 issuerURL,
+					"authorization_endpoint": issuerURL + "/authorize",
+					"token_endpoint":         issuerURL + "/token",
+					"jwks_uri":               issuerURL + "/.well-known/jwks.json",
+					"userinfo_endpoint":      issuerURL + "/discovered-userinfo",
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				err := json.NewEncoder(w).Encode(doc)
+				require.NoError(t, err)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer mockServer.Close()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:   mockServer.URL,
+				ClientID:    "test-client-id",
+				RedirectURI: "http://localhost:8080/callback",
+				UserInfoOverride: &authserver.UserInfoRunConfig{
+					EndpointURL: "https://custom.example.com/userinfo",
+					HTTPMethod:  "POST",
+				},
+			},
+		}
+
+		cfg, err := buildOIDCConfig(context.Background(), rc)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		// UserInfoOverride should take precedence over discovered endpoint
+		require.NotNil(t, cfg.UserInfo)
+		assert.Equal(t, "https://custom.example.com/userinfo", cfg.UserInfo.EndpointURL)
+		assert.Equal(t, "POST", cfg.UserInfo.HTTPMethod)
+	})
+
+	t.Run("no userinfo when not discovered and no override", func(t *testing.T) {
+		t.Parallel()
+
+		// Create mock OIDC server without userinfo endpoint
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == wellKnownOIDCPath ||
+				r.URL.Path == wellKnownOAuthPath {
+				issuerURL := httpScheme + "://" + r.Host
+
+				doc := map[string]interface{}{
+					"issuer":                 issuerURL,
+					"authorization_endpoint": issuerURL + "/authorize",
+					"token_endpoint":         issuerURL + "/token",
+					"jwks_uri":               issuerURL + "/.well-known/jwks.json",
+					// No userinfo_endpoint
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				err := json.NewEncoder(w).Encode(doc)
+				require.NoError(t, err)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer mockServer.Close()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:   mockServer.URL,
+				ClientID:    "test-client-id",
+				RedirectURI: "http://localhost:8080/callback",
+				// No UserInfoOverride
+			},
+		}
+
+		cfg, err := buildOIDCConfig(context.Background(), rc)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		// UserInfo should be nil when not discovered and no override
+		assert.Nil(t, cfg.UserInfo)
+	})
+
+	t.Run("discovery failure returns error", func(t *testing.T) {
+		t.Parallel()
+
+		// Create mock server that returns 404
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "not found", http.StatusNotFound)
+		}))
+		defer mockServer.Close()
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:   mockServer.URL,
+				ClientID:    "test-client-id",
+				RedirectURI: "http://localhost:8080/callback",
+			},
+		}
+
+		_, err := buildOIDCConfig(context.Background(), rc)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OIDC discovery failed")
+	})
+
+	t.Run("resolves client secret from file", func(t *testing.T) {
+		t.Parallel()
+
+		// Create mock OIDC server
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == wellKnownOIDCPath ||
+				r.URL.Path == wellKnownOAuthPath {
+				issuerURL := httpScheme + "://" + r.Host
+
+				doc := map[string]interface{}{
+					"issuer":                 issuerURL,
+					"authorization_endpoint": issuerURL + "/authorize",
+					"token_endpoint":         issuerURL + "/token",
+					"jwks_uri":               issuerURL + "/.well-known/jwks.json",
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				err := json.NewEncoder(w).Encode(doc)
+				require.NoError(t, err)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer mockServer.Close()
+
+		// Create secret file
+		tmpDir := t.TempDir()
+		secretFile := filepath.Join(tmpDir, "client-secret")
+		require.NoError(t, os.WriteFile(secretFile, []byte("my-oidc-client-secret"), 0600))
+
+		rc := &authserver.UpstreamRunConfig{
+			Type: authserver.UpstreamProviderTypeOIDC,
+			OIDCConfig: &authserver.OIDCUpstreamRunConfig{
+				IssuerURL:        mockServer.URL,
+				ClientID:         "test-client-id",
+				ClientSecretFile: secretFile,
+				RedirectURI:      "http://localhost:8080/callback",
+			},
+		}
+
+		cfg, err := buildOIDCConfig(context.Background(), rc)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+
+		assert.Equal(t, "my-oidc-client-secret", cfg.ClientSecret)
 	})
 }
