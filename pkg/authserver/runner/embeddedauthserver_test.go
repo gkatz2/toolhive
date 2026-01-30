@@ -4,6 +4,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -496,5 +497,112 @@ func TestNewHMACSecrets(t *testing.T) {
 		require.NotNil(t, secrets)
 		assert.Equal(t, current, secrets.Current)
 		assert.Nil(t, secrets.Rotated)
+	})
+}
+
+func TestNewEmbeddedAuthServer(t *testing.T) {
+	t.Parallel()
+
+	// createMinimalValidConfig creates a minimal valid RunConfig for testing.
+	// It uses development mode defaults (no signing keys, no HMAC secrets) and
+	// a pure OAuth2 upstream to avoid OIDC discovery.
+	createMinimalValidConfig := func() *authserver.RunConfig {
+		return &authserver.RunConfig{
+			SchemaVersion: authserver.CurrentSchemaVersion,
+			Issuer:        "http://localhost:8080",
+			// SigningKeyConfig nil = development mode (ephemeral key)
+			// HMACSecretFiles empty = development mode (ephemeral secret)
+			Upstreams: []authserver.UpstreamRunConfig{
+				{
+					Name: "test-upstream",
+					Type: authserver.UpstreamProviderTypeOAuth2,
+					OAuth2Config: &authserver.OAuth2UpstreamRunConfig{
+						AuthorizationEndpoint: "https://example.com/authorize",
+						TokenEndpoint:         "https://example.com/token",
+						ClientID:              "test-client-id",
+						RedirectURI:           "http://localhost:8080/oauth/callback",
+						// ClientSecret optional for public clients with PKCE
+					},
+				},
+			},
+			AllowedAudiences: []string{"https://mcp.example.com"},
+		}
+	}
+
+	t.Run("nil config returns error", func(t *testing.T) {
+		t.Parallel()
+
+		server, err := NewEmbeddedAuthServer(context.Background(), nil)
+		require.Error(t, err)
+		assert.Nil(t, server)
+		assert.Contains(t, err.Error(), "config is required")
+	})
+
+	t.Run("valid config creates server with non-nil handler", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := createMinimalValidConfig()
+
+		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
+		require.NoError(t, err)
+		require.NotNil(t, server)
+
+		// Handler() should return non-nil
+		handler := server.Handler()
+		assert.NotNil(t, handler)
+
+		// Clean up
+		require.NoError(t, server.Close())
+	})
+
+	t.Run("Close succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := createMinimalValidConfig()
+
+		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
+		require.NoError(t, err)
+		require.NotNil(t, server)
+
+		// Close should succeed
+		err = server.Close()
+		require.NoError(t, err)
+
+		// Note: Close() is currently not idempotent - the underlying MemoryStorage.Close()
+		// panics on second call due to closing a closed channel. If idempotent Close()
+		// is needed, the storage layer should be updated to handle this gracefully.
+	})
+
+	t.Run("invalid issuer URL returns error", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := createMinimalValidConfig()
+		cfg.Issuer = "not-a-valid-url"
+
+		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
+		require.Error(t, err)
+		assert.Nil(t, server)
+	})
+
+	t.Run("missing upstreams returns error", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := createMinimalValidConfig()
+		cfg.Upstreams = nil
+
+		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
+		require.Error(t, err)
+		assert.Nil(t, server)
+	})
+
+	t.Run("missing allowed audiences returns error", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := createMinimalValidConfig()
+		cfg.AllowedAudiences = nil
+
+		server, err := NewEmbeddedAuthServer(context.Background(), cfg)
+		require.Error(t, err)
+		assert.Nil(t, server)
 	})
 }
